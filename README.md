@@ -95,6 +95,12 @@ unfinished files are attempted again, with additional attempts controlled by
 directories manually only when no workers use them; keep receipts for future
 verified skipping.
 
+FFmpeg runs with `-xerror`: reported decoding/demuxing errors fail the job before
+publication or receipt creation. Receipts from the earlier permissive decoder
+policy are not accepted; existing outputs are preserved as conflicts. Inspect
+them and use a new output root or move them aside before retrying. This does not
+detect missing content that the media container/decoder reports as valid.
+
 Verification reads entire source and output files. Successful encoding also
 checks the source again before publication to detect changes during processing.
 This adds disk/network I/O. Keep source media stable while processing it.
@@ -128,5 +134,7 @@ they never contact remote hosts. Set `BASH_EXE` if needed (Windows defaults to t
 standard Git Bash installation). Coverage includes zero-to-ten-file batches,
 duplicate names, verified reruns, changed inputs/outputs, overwrite refusal,
 bounded retries, empty/failed encodes, remote quoting/failures, cancellation,
-and dry-run behavior. Newline filenames are skipped on Windows because its
+and dry-run behavior. Real synthetic FFmpeg controls also cover truncated input,
+retry after source repair, and valid media paths containing spaces/apostrophes
+(explicitly converted for native Windows FFmpeg). Newline filenames are skipped on Windows because its
 filesystem forbids them.

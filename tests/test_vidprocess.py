@@ -1,4 +1,5 @@
-"""Offline integration tests; ffmpeg and ssh are always temporary local stubs."""
+"""Offline tests using synthetic media and local stubs; SSH never contacts a host."""
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -26,6 +27,7 @@ source=''
 while (( $# )); do
     if [[ $1 == -i ]]; then source=$2; shift 2; else output=$1; shift; fi
 done
+case "$OSTYPE" in msys*|cygwin*) source=$(cygpath -u -- "$source");; esac
 printf '%s\0' "$source" >> "$TEST_CALLS"
 trap 'printf stopped > "$TEST_STOPPED"; exit 143' TERM
 if [[ ${TEST_CANCEL:-0} == 1 ]]; then
@@ -130,6 +132,49 @@ class BatchTests(unittest.TestCase):
         self.assert_ok(result)
         self.assertIn("requested=1 success=0 skipped=1 failed=0", result.stdout)
         self.assertEqual(self.count_calls(), 1)
+
+    def test_permissive_policy_receipt_is_not_trusted(self):
+        source = self.add("one.mp4")
+        self.assert_ok(self.run_batch("--filter", "null"))
+        target = self.output / "one.mp4.mp4"
+        before = target.read_bytes()
+        receipt = next((self.output / ".vidprocess/receipts").iterdir())
+        input_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        old_signature = hashlib.sha256(f"preset-v1|{input_hash}|null".encode()).hexdigest()
+        receipt.write_text(old_signature + "\n" + hashlib.sha256(before).hexdigest() + "\n")
+        result = self.run_batch("--filter", "null")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(self.count_calls(), 1)
+        self.assertIn("skipped=0 failed=1", result.stdout)
+
+    def test_real_truncated_video_retries_then_accepts_repaired_source(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("FFmpeg required for real synthetic video check")
+        (self.bin / "ffmpeg").unlink()
+        reference = self.base / "valid.mp4"
+        subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=128x96:rate=25:duration=2", "-c:v", "libx264",
+                        "-movflags", "+faststart", "-y", str(reference)],
+                       check=True, capture_output=True, timeout=30)
+        source = self.inputs / "clip.mp4"
+        data = reference.read_bytes()
+        source.write_bytes(data[:len(data)//2])
+        for _ in range(2):
+            result = self.run_batch("--filter", "null")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("success=0 skipped=0 failed=1", result.stdout)
+            self.assertFalse((self.output / "clip.mp4.mp4").exists())
+            self.assertEqual(list((self.output / ".vidprocess/receipts").iterdir()), [])
+            self.assertFalse(list(self.output.rglob(".vidprocess.*.mp4")))
+        source.write_bytes(data)
+        repaired = self.run_batch("--filter", "null")
+        logs = "\n".join(p.read_text() for p in self.output.glob(".vidprocess/runs/*/*.log"))
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr + logs)
+        result = self.run_batch("--filter", "null")
+        self.assert_ok(result)
+        self.assertIn("success=0 skipped=1 failed=0", result.stdout)
 
     def test_unrelated_existing_output_is_preserved(self):
         self.add("one.mp4")

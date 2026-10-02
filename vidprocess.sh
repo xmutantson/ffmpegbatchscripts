@@ -51,7 +51,7 @@ worker() {
     trap worker_cleanup EXIT
     trap worker_stop INT TERM
     input_hash=$(hash_file "$source") || return 1
-    signature=$(hash_text "preset-v1|$input_hash|$filter") || return 1
+    signature=$(hash_text "preset-v2-strict-decode|$input_hash|$filter") || return 1
     if [[ -e "$destination" || -L "$destination" ]]; then
         if [[ -f "$destination" && ! -L "$destination" && -f "$receipt" ]]; then
             { IFS= read -r old_signature; IFS= read -r old_output; } < "$receipt" || return 1
@@ -75,9 +75,17 @@ worker() {
     actual_parent=$(cd -- "$parent" && pwd -P) || return 1
     [[ "$actual_parent/" == "$output_root/"* ]] || return 1
     temporary=$(mktemp "$parent/.vidprocess.XXXXXXXX.mp4") || return 1
-    ffmpeg -nostdin -hide_banner -v error -i "$source" \
+    # Native Windows FFmpeg needs explicit conversion for paths containing quotes.
+    local media_source=$source media_output=$temporary
+    case "$OSTYPE" in
+        msys*|cygwin*)
+            media_source=$(cygpath -am -- "$source") || return 1
+            media_output=$(cygpath -am -- "$temporary") || return 1
+            ;;
+    esac
+    ffmpeg -nostdin -hide_banner -v error -xerror -i "$media_source" \
         -vf "$filter" -c:v libx264 -preset medium -crf 23 \
-        -c:a aac -ar 48000 -ac 2 -b:a 128k -f mp4 -y "$temporary" &
+        -c:a aac -ar 48000 -ac 2 -b:a 128k -f mp4 -y "$media_output" &
     child=$!
     local encode_status=0
     wait "$child" || encode_status=$?
