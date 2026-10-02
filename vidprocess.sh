@@ -1,359 +1,280 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Shared-storage batch transcoding. Requires Bash 4.4+ and GNU core utilities.
+set -uo pipefail
 
-# Define the directory to search for video files
-directory="/YOUR-ABSOLUTE/PATH/HERE"
-user="username"
+die() { printf 'Error: %s\n' "$*" >&2; exit 2; }
+(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) || die 'Bash 4.4 or newer is required'
+hash_file() { sha256sum < "$1" | cut -d ' ' -f 1; }
+hash_text() { printf '%s' "$1" | sha256sum | cut -d ' ' -f 1; }
 
-# Define list of all servers including localhost
-servers=("localhost" "192.168.2.21" "192.168.2.11")
-# Define a mapping of part files to server hostnames and IPs. Needed for monitor_progress 
-declare -A server_map=(["aa"]="192.168.2.21" ["ab"]="192.168.2.11" ["ac"]="localhost")
-part_files=("$directory/files_list_partaa" "$directory/files_list_partab" "$directory/files_list_partac") # Adjust as needed based on actual part files generated
-# Adjust max_concurrent_jobs in process_files()
+usage() {
+    cat <<'EOF'
+Usage: bash vidprocess.sh --input DIR [options]
+  --output DIR       Output root (default: INPUT/transcoded)
+  --host HOST        Worker host; repeat for multiple hosts (default: localhost)
+  --user USER        SSH username (default: SSH configuration)
+  --jobs N           Concurrent encodes per host (default: 2)
+  --retries N        Additional attempts per failed job (default: 0)
+  --filter FILTER    FFmpeg video filter (default: original crop/scale preset)
+  --dry-run          List planned files without writes or SSH connections
+  --help            Show this help
 
-check_rw_access() { # Function to check read/write access. Called by check_directory_exists
-    local server=$1
-    local check_file="${directory}/rw_check.tmp"
+All hosts must share the same absolute input/output paths and have Bash 4.4+,
+GNU core utilities and FFmpeg with libx264/AAC. Outputs preserve relative paths
+and append .mp4 to the complete input filename. Existing files are never replaced.
+EOF
+}
 
-    # Command to create and then remove a temporary file
-    local cmd="touch '${check_file}' && rm '${check_file}'"
+check_tools() {
+    local tool
+    for tool in ffmpeg sha256sum cut mktemp mv ln mkdir rm rmdir realpath dirname cat; do
+        command -v "$tool" >/dev/null || die "Required command unavailable: $tool"
+    done
+}
 
-    if [ "$server" = "localhost" ]; then
-        # Execute command directly for local server
-        if ! eval "$cmd"; then
-            echo "Error: Unable to write to ${directory} on local server. Check read/write permissions."
-            exit 1
+worker() {
+    local source=$1 destination=$2 state=$3 run=$4 id=$5 filter=$6 attempt=$7
+    local receipt="$state/receipts/$id"
+    # Cleanup variables outlive this function until the worker shell exits.
+    lock="$state/locks/$id"
+    temporary='' child='' receipt_tmp=''
+    local input_hash output_hash signature old_signature old_output
+    worker_cleanup() {
+        if [[ -n "$child" ]]; then kill "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi
+        [[ -z "$temporary" ]] || rm -f -- "$temporary"
+        [[ -z "$receipt_tmp" ]] || rm -f -- "$receipt_tmp"
+        rmdir -- "$lock" 2>/dev/null || :
+    }
+    worker_stop() { exit 130; }
+    check_tools
+    mkdir -- "$lock" 2>/dev/null || { printf 'Output is locked: %s\n' "$destination" >&2; return 1; }
+    trap worker_cleanup EXIT
+    trap worker_stop INT TERM
+    input_hash=$(hash_file "$source") || return 1
+    signature=$(hash_text "preset-v2-strict-decode|$input_hash|$filter") || return 1
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        if [[ -f "$destination" && ! -L "$destination" && -f "$receipt" ]]; then
+            { IFS= read -r old_signature; IFS= read -r old_output; } < "$receipt" || return 1
+            output_hash=$(hash_file "$destination") || return 1
+            if [[ "$signature" == "$old_signature" && "$output_hash" == "$old_output" ]]; then
+                printf 'skipped\n' > "$run/$id.result"
+                return 0
+            fi
         fi
-    else
-        # Execute command via SSH for remote servers
-        if ! ssh "$user"@"$server" "$cmd"; then
-            echo "Error: Unable to write to ${directory} on server $server. Check read/write permissions."
-            exit 1
-        fi
+        printf 'Existing output has no matching verified receipt; preserving it: %s\n' "$destination" >&2
+        return 1
     fi
+    local parent
+    parent=$(dirname -- "$destination")
+    # Check prospective paths before creating directories, then verify again.
+    local actual_parent output_root
+    actual_parent=$(realpath -m -- "$parent") || return 1
+    output_root=$(cd -- "$state/.." && pwd -P) || return 1
+    [[ "$actual_parent/" == "$output_root/"* ]] || { printf 'Output escapes output root\n' >&2; return 1; }
+    mkdir -p -- "$parent" || return 1
+    actual_parent=$(cd -- "$parent" && pwd -P) || return 1
+    [[ "$actual_parent/" == "$output_root/"* ]] || return 1
+    temporary=$(mktemp "$parent/.vidprocess.XXXXXXXX.mp4") || return 1
+    # Native Windows FFmpeg needs explicit conversion for paths containing quotes.
+    local media_source=$source media_output=$temporary
+    case "$OSTYPE" in
+        msys*|cygwin*)
+            media_source=$(cygpath -am -- "$source") || return 1
+            media_output=$(cygpath -am -- "$temporary") || return 1
+            ;;
+    esac
+    ffmpeg -nostdin -hide_banner -v error -xerror -i "$media_source" \
+        -vf "$filter" -c:v libx264 -preset medium -crf 23 \
+        -c:a aac -ar 48000 -ac 2 -b:a 128k -f mp4 -y "$media_output" &
+    child=$!
+    local encode_status=0
+    wait "$child" || encode_status=$?
+    child=''
+    (( encode_status == 0 )) || return "$encode_status"
+    [[ -s "$temporary" ]] || { printf 'Encoder produced an empty output\n' >&2; return 1; }
+    [[ "$(hash_file "$source")" == "$input_hash" ]] || { printf 'Input changed during encoding\n' >&2; return 1; }
+    output_hash=$(hash_file "$temporary") || return 1
+    # A hard link atomically publishes a complete file and fails if the name exists.
+    # No replace/force flag: an unrelated writer's destination is always preserved.
+    ln -T -- "$temporary" "$destination" || return 1
+    rm -- "$temporary" || return 1
+    temporary=''
+    receipt_tmp=$(mktemp "$state/receipts/.receipt.XXXXXXXX") || return 1
+    printf '%s\n%s\n' "$signature" "$output_hash" > "$receipt_tmp" || return 1
+    mv -- "$receipt_tmp" "$receipt" || return 1
+    receipt_tmp=''
+    printf 'success\n' > "$run/$id.result"
 }
 
-check_directory_exists(){ # Check directory existence and read/write access on all servers
-for server in "${servers[@]}"; do
-    if [ "$server" = "localhost" ]; then
-        # Check directory on the local server
-        if [ ! -d "$directory" ]; then
-            echo "Directory does not exist on local server."
-            exit 1
-        else
-            echo "Directory exists on local server. Checking read/write access..."
-            check_rw_access "$server"
-        fi
-    else
-        # Check directory on remote servers
-        if ! ssh "$user"@"$server" "[ -d '$directory' ]"; then
-            echo "Directory does not exist on server $server."
-            exit 1
-        else
-            echo "Directory exists on server $server. Checking read/write access..."
-            check_rw_access "$server"
-        fi
-    fi
-done
-echo "All servers have read/write access to the directory. Proceeding with the script..."
-}
-
-find_files(){ #find all video files in $directory
-# Find video files and generate a list
-find "$directory" -type f -regex '.*\.\(mp4\|mov\|avi\|mkv\|flv\|wmv\|mpeg\|mpg\|webm\|3gp\|ogg\|ogv\|ts\)' > "$directory/files_list.txt"
-echo "File list generated: $directory/files_list.txt"
-}
-
-prep_files() { #set up the error log and divide files_list for distribution to servers, based on file number. Last file will catch the remainder.
-# Create or clear the error log file
-error_log="$directory/error_log.txt"
-echo "Error log: $error_log"
-> "$error_log"
-
-# Divide the total number of files evenly among the servers
-total_files=$(wc -l < "$directory/files_list.txt")
-echo "Total files: $total_files"
-files_per_machine=$((total_files / 3))
-echo "Files per machine: $files_per_machine"
-files_per_thread=$((files_per_machine / 56))
-echo "Files per thread: $files_per_thread"
-
-# Split the file list into three parts
-split -l "$files_per_machine" "$directory/files_list.txt" "$directory/files_list_part"
-
-# Merge extra part file if exists
-if [ -f "$directory/files_list_partad" ]; then
-    cat "$directory/files_list_partac" "$directory/files_list_partad" > "$directory/temp_ac"
-    mv "$directory/temp_ac" "$directory/files_list_partac"
-    rm "$directory/files_list_partad"
+# Internal modes are also used by the script sent to remote workers over stdin.
+if [[ ${1:-} == --internal-worker ]]; then
+    shift
+    (( $# == 7 )) || die 'Invalid worker arguments'
+    worker "$@"
+    exit $?
 fi
+if [[ ${1:-} == --internal-check ]]; then
+    shift
+    (( $# == 2 )) || die 'Invalid preflight arguments'
+    check_tools
+    [[ -f "$1" && "$(cat -- "$1")" == "$2" ]] || die 'Worker cannot see shared run state'
+    probe=$(mktemp "$(dirname -- "$1")/.probe.XXXXXXXX") || exit 2
+    link="$probe.link"
+    ln -T -- "$probe" "$link" || { rm -f -- "$probe"; die 'Output filesystem must support hard links'; }
+    rm -- "$link" "$probe" || exit 2
+    exit 0
+fi
+
+input='' output='' user='' jobs=2 retries=0 dry_run=0
+filter='crop=1584:1072:158:6,scale=640:480'
+hosts=()
+while (( $# )); do
+    case $1 in
+        --help|-h) usage; exit 0 ;;
+        --dry-run) dry_run=1; shift ;;
+        --input|--output|--user|--jobs|--retries|--filter|--host)
+            (( $# >= 2 )) || die "Missing value for $1"
+            case $1 in
+                --input) input=$2 ;; --output) output=$2 ;; --user) user=$2 ;;
+                --jobs) jobs=$2 ;; --retries) retries=$2 ;; --filter) filter=$2 ;;
+                --host) hosts+=("$2") ;;
+            esac
+            shift 2 ;;
+        *) die "Unknown option: $1" ;;
+    esac
+done
+[[ -n "$input" && -d "$input" ]] || die '--input must name an existing directory'
+[[ "$jobs" =~ ^[1-9][0-9]*$ && ${#jobs} -le 3 ]] || die '--jobs must be an integer from 1 to 999'
+[[ "$retries" =~ ^[0-9]+$ && ${#retries} -le 2 ]] || die '--retries must be an integer from 0 to 99'
+retries=$((10#$retries))
+[[ -n "$filter" ]] || die '--filter must not be empty'
+(( ${#hosts[@]} )) || hosts=(localhost)
+for host in "${hosts[@]}"; do
+    [[ "$host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:-]*$ ]] || die "Invalid host: $host"
+done
+[[ -z "$user" || "$user" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || die 'Invalid SSH username'
+input=$(cd -- "$input" && pwd -P) || exit 2
+output=${output:-"$input/transcoded"}
+command -v realpath >/dev/null || die 'GNU realpath is required'
+output=$(realpath -m -- "$output") || exit 2
+[[ "$input" != / && "$output" != / && "$input" != "$output" && "$input/" != "$output/"* ]] || die 'Input/output cannot be filesystem root; output must not equal or contain input'
+state="$output/.vidprocess"
+script=$(realpath -- "${BASH_SOURCE[0]}") || exit 2
+
+# Snapshot discovery using NUL delimiters, including uppercase extensions. Prune
+# generated outputs and state; do not follow symlinks into other directory trees.
+files=()
+output_pattern=${output//\\/\\\\}
+output_pattern=${output_pattern//\*/\\*}
+output_pattern=${output_pattern//\?/\\?}
+output_pattern=${output_pattern//\[/\\[}
+discover() {
+    find "$input" -path "$output_pattern" -prune -o -type f \
+        \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' \
+        -o -iname '*.flv' -o -iname '*.wmv' -o -iname '*.mpeg' -o -iname '*.mpg' \
+        -o -iname '*.webm' -o -iname '*.3gp' -o -iname '*.ogg' -o -iname '*.ogv' -o -iname '*.ts' \) -print0
 }
+if (( dry_run )); then
+    # pipefail propagates discovery failures; dry-run creates no directories/files.
+    discover | while IFS= read -r -d '' file; do printf '%q -> %q\n' "$file" "$output/${file#"$input/"}.mp4"; done
+    exit $?
+fi
 
-checkfiles() { # triple check that files_list.txt and all parts are valid paths before we start actually chewing on them
+mkdir -p -- "$state" || exit 2
+[[ ! -L "$state" ]] || die 'State directory must not be a symlink'
+mkdir -- "$state/lock" 2>/dev/null || die "Run lock exists: $state/lock (ensure no workers remain before manually removing a stale lock)"
+pids=() slot_ids=() slot_hosts=() interrupted=0
+cleanup() {
+    local pid
+    for pid in "${pids[@]}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || :; done
+    for pid in "${pids[@]}"; do [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || :; done
+    rmdir -- "$state/lock" 2>/dev/null || :
+}
+stop() { interrupted=1; exit 130; }
+trap cleanup EXIT
+trap stop INT TERM
+mkdir -p -- "$state/runs" "$state/receipts" "$state/locks" || exit 2
+for dir in "$state/runs" "$state/receipts" "$state/locks"; do [[ ! -L "$dir" ]] || die "State path must not be a symlink: $dir"; done
+run=$(mktemp -d "$state/runs/run.XXXXXXXX") || exit 2
+printf 'Run state: %s\n' "$run"
+discover > "$run/files.nul" || die 'Input discovery failed; inspect directory permissions'
+while IFS= read -r -d '' file; do files+=("$file"); done < "$run/files.nul"
+for file in "${files[@]}"; do
+    [[ "$file" != "$input/.vidprocess/"* ]] || die 'Input .vidprocess subtree conflicts with reserved output state; select a narrower input directory'
+done
+printf 'Requested: %s\n' "${#files[@]}"
+if (( ${#files[@]} == 0 )); then printf 'No matching inputs.\n'; exit 0; fi
+token=$(hash_text "$run|$$|$RANDOM") || exit 2
+printf '%s' "$token" > "$run/shared-token"
 
-# After generating files_list.txt
-echo "Checking validity of file paths in files_list.txt..."
-
-while IFS= read -r file; do
-    if [ ! -f "$file" ]; then
-        echo "Invalid file path detected: $file"
-        exit 1
+remote() (
+    local host=$1; shift
+    local command='bash -s --' argument quoted target=$host
+    [[ -z "$user" ]] || target="$user@$host"
+    for argument in "$@"; do
+        # POSIX single-quote escaping also supports apostrophes/newlines in paths.
+        quoted=${argument//\'/\'\\\'\'}
+        command+=" '$quoted'"
+    done
+    exec ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "$command" < "$script"
+)
+for host in "${hosts[@]}"; do
+    if [[ "$host" == localhost ]]; then
+        bash "$script" --internal-check "$run/shared-token" "$token" || die 'Local preflight failed'
+    else
+        command -v ssh >/dev/null || die 'SSH is required for remote workers'
+        remote "$host" --internal-check "$run/shared-token" "$token" || die "Preflight failed on $host"
     fi
-done < "$directory/files_list.txt"
+    for ((j=0; j<jobs; j++)); do slot_hosts+=("$host"); pids+=(''); slot_ids+=(''); done
+done
 
-echo "All file paths in files_list.txt are valid."
-
-for server in "${servers[@]}"; do
-    for part_file in "${part_files[@]}"; do
-        if [ "$server" = "localhost" ]; then
-            # Check part file on the local server
-            if [ ! -f "$part_file" ]; then
-                echo "Part file does not exist on local server: $part_file"
-                exit 1
-            fi
+run_job() {
+    trap - EXIT
+    local host=$1 file=$2 destination=$3 id=$4 attempt status=1 worker_pid=''
+    job_stop() { [[ -z "$worker_pid" ]] || kill "$worker_pid" 2>/dev/null || :; [[ -z "$worker_pid" ]] || wait "$worker_pid" 2>/dev/null || :; exit 130; }
+    trap job_stop INT TERM
+    for ((attempt=0; attempt<=retries; attempt++)); do
+        if [[ "$host" == localhost ]]; then
+            bash "$script" --internal-worker "$file" "$destination" "$state" "$run" "$id" "$filter" "$attempt" > "$run/$id.$attempt.log" 2>&1 &
         else
-            # Check part file on remote servers
-            if ! ssh "$user"@"$server" "[ -f '$part_file' ]"; then
-                echo "Part file does not exist on server $server: $part_file"
-                exit 1
-            fi
+            remote "$host" --internal-worker "$file" "$destination" "$state" "$run" "$id" "$filter" "$attempt" > "$run/$id.$attempt.log" 2>&1 &
         fi
+        worker_pid=$!
+        status=0
+        wait "$worker_pid" || status=$?
+        worker_pid=''
+        (( status != 0 )) || return 0
     done
+    printf 'failed\n' > "$run/$id.result"
+    return 1
+}
+
+success=0 skipped=0 failed=0 finished=0
+reap() {
+    local slot=$1 result='failed' status=0 id=${slot_ids[$1]}
+    [[ -n "${pids[$slot]}" ]] || return 0
+    wait "${pids[$slot]}" || status=$?
+    pids[$slot]=''
+    if (( status == 0 )) && [[ -f "$run/$id.result" ]]; then IFS= read -r result < "$run/$id.result" || result=failed; fi
+    case $result in success) ((success+=1)) ;; skipped) ((skipped+=1)) ;; *) ((failed+=1)); printf '%s\0' "${job_sources[$id]}" >> "$run/retry.nul" ;; esac
+    ((finished+=1))
+    printf 'Completed %s/%s: success=%s skipped=%s failed=%s\n' "$finished" "${#files[@]}" "$success" "$skipped" "$failed"
+}
+declare -A job_sources=()
+index=0
+for file in "${files[@]}"; do
+    relative=${file#"$input/"}
+    id=$(hash_text "$relative") || exit 2
+    job_sources[$id]=$file
+    destination="$output/$relative.mp4"
+    slot=$((index % ${#slot_hosts[@]}))
+    reap "$slot"
+    printf '%s\t%q\t%q\t%s\n' "$id" "$file" "$destination" "${slot_hosts[$slot]}" >> "$run/manifest.tsv" || die 'Could not write run manifest'
+    run_job "${slot_hosts[$slot]}" "$file" "$destination" "$id" &
+    pids[$slot]=$!
+    slot_ids[$slot]=$id
+    ((index+=1))
 done
-
-echo "All part files exist on all servers."
-}
-
-process_files() { # Function to process files in parallel with controlled concurrency. called by process_workers_start in loop
-    local file_list_part="$1"
-    local max_concurrent_jobs=10 # Adjust based on system capacity
-    local job_count=0
-    local base_marker_dir="$directory/zzzzz-process_markers"
-    local part_name=$(basename "$file_list_part" | sed 's/files_list_part//') # Extract 'aa', 'ab', or 'ac'
-    local marker_dir="$base_marker_dir/$part_name"
-    local transcoded_dir="$directory/transcoded" # Subdirectory for transcoded files
-
-    # Ensure the marker and transcoded directory exists
-    mkdir -p "$marker_dir"
-	mkdir -p "$transcoded_dir"
-
-    echo "Inside process_files with: $file_list_part on host: $(hostname)"
-
-    declare -a job_pids=()  # Array to hold job PIDs
-
-    while IFS= read -r file; do
-	local out_file="$transcoded_dir/$(basename "$file")"
-        if (( job_count >= max_concurrent_jobs )); then
-            # Wait for any job to finish before starting a new one
-            wait -n "${job_pids[@]}"
-            # Remove finished jobs from the array
-            job_pids=($(jobs -rp))
-            job_count=${#job_pids[@]}
-        fi
-
-        (
-           # echo "Processing file on host: $(hostname)"
-            if ffmpeg -nostdin -v error -i "$file" \
-                -vf "crop=1584:1072:158:6,scale=640:480" \
-                -c:v libx264 -preset medium -crf 23 \
-                -c:a aac -ar 48000 -ac 2 -b:a 128k \
-                "$out_file" -y; then
-                # On success, create a success marker file
-                touch "$marker_dir/$(basename "$file").success"
-                # echo "Successfully processed $file on host: $(hostname)"
-            else
-		#echo "Error log: $error_log"
-                echo "$file" >> "$error_log"
-		touch "$marker_dir/$(basename "$file").failure"
-            fi
-        ) &
-
-        # Capture PID of the background job
-        job_pids+=($!)
-        ((job_count++))
-    done < "$file_list_part"
-
-    # Wait for all remaining background jobs to finish
-    wait
-
-    # count and log the number of success/failure markers for this part after processing
-    local success_count=$(find "$marker_dir" -type f -name '*.success' | wc -l)
-    local failure_count=$(find "$marker_dir" -type f -name '*.failure' | wc -l)
-    local processed_count=$((success_count + failure_count))
-    echo "Total files successfully processed for part $part_name: $processed_count"
-}
-
-monitor_progress() { # monitor job progress, called in process_workers_start
-    local base_marker_dir="./zzzzz-process_markers"
-    local report_interval=600 # Report every 10 minutes (600 seconds)
-    local total_processed
-
-while :; do
-        echo "---- Processing Report: $(date) ----"
-        total_processed=0
-        for part in "${!server_map[@]}"; do
-            local server_ip=${server_map[$part]}
-            local hostname
-
-            # Fetch hostname for remote servers, or use $(hostname) for localhost
-            if [[ "$server_ip" == "localhost" ]]; then
-                hostname=$(hostname)
-            else
-                hostname=$(ssh "$server_ip" 'hostname')
-            fi
-
-            local part_dir="$base_marker_dir/$part"
-            local count=0
-            if [[ -d "$part_dir" ]]; then
-                count=$(find "$part_dir" -type f -name '*.success' | wc -l)
-            fi
-
-            echo "Server: $hostname ($server_ip), Part $part: $count files processed."
-            ((total_processed+=count))
-        done
-        echo "Total processed across all servers: $total_processed"
-        echo "----------------------------------------"
-
-        sleep "$report_interval"
-    done
-}
-
-process_workers_start() { # spawn workers and start processing the files.
-monitor_progress &
-monitor_pid=$!
-
-# Initialize an array to hold background process IDs
-bg_processes=()
-
-# Process files on each server
-for part in aa ab ac; do
-    file_list_part="$directory/files_list_part$part"
-    base_marker_dir="$directory/zzzzz-process_markers" # Ensure this uses the global $directory variable
-
-    if [ "$part" = "aa" ]; then
-        server="192.168.2.21"
-    elif [ "$part" = "ab" ]; then
-        server="192.168.2.11"
-    else
-        server="localhost"
-    fi
-
-    if [ "$server" != "localhost" ]; then
-        # Use SSH to process files remotely in parallel
-        ssh "$user"@"$server" "bash -c 'directory=\"$directory\"; file_list_part=\"$file_list_part\"; base_marker_dir=\"$base_marker_dir\"; error_log=\"$error_log\"; $(declare -f process_files); process_files \"\$file_list_part\"'" &
-        bg_processes+=($!)
-    else
-        # Process files locally in parallel
-        process_files "$file_list_part" &
-        bg_processes+=($!)
-    fi
-done
-
-# Wait for all background processes to complete
-for pid in "${bg_processes[@]}"; do
-    wait $pid
-done
-
-echo "All processing complete."
-echo "Error log is located at: $error_log"
-kill "$monitor_pid"
-
-}
-
-summarize_and_compare() { # summarize completed work, check the initial work list. If different, missed some files. Write missed files to errormissing.log
-    local base_marker_dir="$directory/zzzzz-process_markers"
-    local processed_files_log="$directory/errormissing.log"
-    local total_requested_files=$(wc -l < "$directory/files_list.txt")
-    local total_processed_files=0
-
-    # Reset or create the log file
-    > "$processed_files_log"
-
-    # Generate a temporary file listing all processed filenames (without the .success extension)
-    local processed_filenames="$directory/processed_filenames.tmp"
-    find "$base_marker_dir" -type f -name '*.success' -exec basename {} .success \; > "$processed_filenames"
-
-    echo "Summary of processing:"
-    for part in aa ab ac; do
-    # Count both success and failure markers within each part
-    local success_count=$(find "$base_marker_dir/$part" -type f -name '*.success' | wc -l)
-    local failure_count=$(find "$base_marker_dir/$part" -type f -name '*.failure' | wc -l)
-    local part_processed_count=$((success_count + failure_count))
-
-    echo "Part $part processed files: $part_processed_count"
-    ((total_processed_files+=part_processed_count))
-    done
-
-    echo "Total requested files: $total_requested_files"
-    echo "Total processed files: $total_processed_files"
-
-    # Directly log missed file paths to errormissing.log without additional comments
-    if [ "$total_requested_files" -ne "$total_processed_files" ]; then
-        echo "Identifying missed files..."
-
-        while IFS= read -r file; do
-            local file_basename=$(basename "$file")
-            if ! grep -Fxq "$file_basename" "$processed_filenames"; then
-                echo "$file" >> "$processed_files_log"
-            fi
-        done < "$directory/files_list.txt"
-    else
-        echo "All requested files have been successfully processed."
-		rm -f "$processed_files_log" # delete the errormissing.log file, it's blank
-    fi
-	# Cleanup temporary file
-    rm "$processed_filenames"
-
-#reprocessing stage
-	if [ -f "$processed_files_log" ]; then
-		echo "Missed files detected. Reprocessing needed."
-		
-		while true; do
-        # Prompt the user for their decision on reprocessing
-        echo "Would you like to reprocess the missed files now? (y/n)"
-        read -r user_decision
-        
-        if [[ "$user_decision" == "y" ]]; then
-            echo "Reprocessing missed files......"
-            
-			cp "$processed_files_log" "$directory/files_list.txt" # clears files_list.txt and overwrites with the contents of errormissing.log 
-			rm -rf "$directory/zzzzz-process_markers" # delete the old success files. If we dont, then on the second round through if we have any leftovers theyll trigger summarize_and_compare for missing files. 
-			prep_files #divide files_list.txt for distribution to servers, based on file number. Last file will catch the remainder.
-			checkfiles # triple check that files_list.txt and all parts are valid paths before we start actually chewing on them. useful to debug cryptic "no such file" errors
-			process_workers_start # spawn workers and start processing the files.
-			# the potential exists for summarize_and_compare to call itself below. These nested loops should all self-terminate if the user or script chooses not to reprocess.
-			summarize_and_compare # summarize completed work, check the initial work list. If different, missed some files. Write missed files to errormissing.log. 
-            
-            break  # Exit the loop after handling valid input
-        elif [[ "$user_decision" == "n" ]]; then
-            echo "User chose not to reprocess missed files. Proceeding without reprocessing."
-            break  # Exit the loop after handling valid input
-        else
-            echo "Invalid input. Please enter 'y' for yes or 'n' for no."
-            # The loop will continue, prompting the user again for valid input
-        fi
-    done
-		
-	else
-		echo "No missed files. Reprocessing not required. Script exiting."
-	fi
-}
-
-
-#main program. Function-heavy because it's easier to debug, so the following statements are functions meant to run sequentially.
-
-check_directory_exists # Check directory existence and read/write access on all servers
-find_files # find all video files in $directory
-# re-run from here
-prep_files #divide files_list for distribution to servers, based on file number. Last file will catch the remainder.
-# checkfiles # triple check that files_list.txt and all parts are valid paths before we start actually chewing on them. useful to debug cryptic "no such file" errors
-process_workers_start # spawn workers and start processing the files.
-summarize_and_compare # summarize completed work, check the initial work list. If different, missed some files. Write missed files to errormissing.log
-
-#sort the error_log.txt file alphabetically for ease of review
-sort "$error_log" | uniq > "$error_log.tmp" && mv "$error_log.tmp" "$error_log"
-
-# Clean up temporary files. not a function because we should only clean up if the script made it all the way through to here.
-echo "Cleaning up temporary files and exiting"
-rm "$directory/files_list.txt" "$directory/files_list_part"*
-rm -rf "$directory/zzzzz-process_markers"
+for ((slot=0; slot<${#pids[@]}; slot++)); do reap "$slot"; done
+printf 'Summary: requested=%s success=%s skipped=%s failed=%s\nLogs and manifests: %s\n' "${#files[@]}" "$success" "$skipped" "$failed" "$run"
+(( failed == 0 ))
